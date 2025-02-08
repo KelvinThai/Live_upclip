@@ -8,6 +8,8 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
+const BATCH_SIZE = 3; // Process 3 frames per request
+const DELAY_BETWEEN_BATCHES = 1000; // 1 second delay between batches
 
 @Injectable()
 export class AnalyzerAgentService {
@@ -131,6 +133,118 @@ export class AnalyzerAgentService {
     }
   }
 
+  private async delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async processBatch(
+    base64Frames: string[],
+    startIndex: number,
+  ): Promise<{
+    moments: Array<{
+      frameNumber: number;
+      description: string;
+      viralPotential: number;
+      suggestedTitle: string;
+      suggestedHashtags: string[];
+    }>;
+  }> {
+    console.log(`Processing batch starting at frame ${startIndex + 1}`);
+    const response = await this.openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `Analyze these frames from a video and identify potential viral moments. For each moment:
+              1. Identify the frame number (use absolute frame numbers starting from ${startIndex + 1})
+              2. Describe what makes it engaging
+              3. Rate its viral potential (1-10)
+              4. Suggest a catchy title
+              5. Suggest relevant hashtags
+              Format the response as JSON with these fields in an array called 'moments': frameNumber, description, viralPotential, suggestedTitle, suggestedHashtags.`,
+            } as const,
+            ...base64Frames.map((frame) => ({
+              type: 'image_url' as const,
+              image_url: {
+                url: frame,
+              },
+            })),
+          ],
+        },
+      ],
+      max_tokens: 1000,
+      response_format: { type: 'json_object' as const },
+    });
+
+    const content = response.choices[0].message.content;
+    if (!content) {
+      console.log('No content in OpenAI response for batch');
+      return { moments: [] };
+    }
+
+    interface BatchResponse {
+      moments: Array<{
+        frameNumber: number;
+        description: string;
+        viralPotential: number;
+        suggestedTitle: string;
+        suggestedHashtags: string[];
+      }>;
+    }
+
+    const parsedContent = JSON.parse(content) as BatchResponse;
+    return parsedContent;
+  }
+
+  private async processFramesInBatches(base64Frames: string[]): Promise<
+    Array<{
+      frameNumber: number;
+      description: string;
+      viralPotential: number;
+      suggestedTitle: string;
+      suggestedHashtags: string[];
+    }>
+  > {
+    const allMoments: Array<{
+      frameNumber: number;
+      description: string;
+      viralPotential: number;
+      suggestedTitle: string;
+      suggestedHashtags: string[];
+    }> = [];
+
+    for (let i = 0; i < base64Frames.length; i += BATCH_SIZE) {
+      const batch = base64Frames.slice(i, i + BATCH_SIZE);
+      try {
+        console.log(
+          `Processing batch ${i / BATCH_SIZE + 1} of ${Math.ceil(base64Frames.length / BATCH_SIZE)}`,
+        );
+        const result = await this.processBatch(batch, i);
+        if (result.moments) {
+          allMoments.push(...result.moments);
+        }
+
+        if (i + BATCH_SIZE < base64Frames.length) {
+          console.log(
+            `Waiting ${DELAY_BETWEEN_BATCHES}ms before next batch...`,
+          );
+          await this.delay(DELAY_BETWEEN_BATCHES);
+        }
+      } catch (error) {
+        console.error(
+          `Error processing batch starting at frame ${i + 1}:`,
+          error,
+        );
+        // Continue with next batch even if current one fails
+      }
+    }
+
+    return allMoments;
+  }
+
   async analyzeVideo(videoPath: string): Promise<ViralMomentAnalysis[]> {
     console.log(`Starting video analysis for: ${videoPath}`);
     try {
@@ -151,48 +265,9 @@ export class AnalyzerAgentService {
       console.log('Converting frames to base64...');
       const base64Frames = await this.convertFramesToBase64(frames);
 
-      console.log('Making OpenAI API request for video analysis...');
-      const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `Analyze these frames from a video and identify potential viral moments. For each moment:
-                1. Identify the frame number (1-based index)
-                2. Describe what makes it engaging
-                3. Rate its viral potential (1-10)
-                4. Suggest a catchy title
-                5. Suggest relevant hashtags
-                Format the response as JSON with these fields in an array called 'moments': frameNumber, description, viralPotential, suggestedTitle, suggestedHashtags.
-                Example format:
-                {
-                  "moments": [
-                    {
-                      "frameNumber": 1,
-                      "description": "...",
-                      "viralPotential": 8,
-                      "suggestedTitle": "...",
-                      "suggestedHashtags": ["..."]
-                    }
-                  ]
-                }`,
-              } as const,
-              ...base64Frames.map((frame) => ({
-                type: 'image_url' as const,
-                image_url: {
-                  url: frame,
-                },
-              })),
-            ],
-          },
-        ],
-        max_tokens: 1000,
-        response_format: { type: 'json_object' as const },
-      });
-      console.log('Received response from OpenAI');
+      // Process frames in batches
+      console.log('Processing frames in batches...');
+      const moments = await this.processFramesInBatches(base64Frames);
 
       // Cleanup frames
       console.log('Cleaning up temporary frame files...');
@@ -201,89 +276,34 @@ export class AnalyzerAgentService {
       );
       console.log('Frame cleanup completed');
 
-      const content = response.choices[0].message.content;
-      if (!content) {
-        console.log('No content in OpenAI response, returning empty array');
-        return [];
-      }
+      // Add time ranges to moments
+      const momentsWithTimeRanges = moments
+        .map((moment) => {
+          if (!moment.frameNumber) {
+            console.error('Invalid moment format:', moment);
+            return null;
+          }
 
-      try {
-        console.log('Parsing OpenAI response...');
-        interface MomentData {
-          frameNumber: number;
-          description: string;
-          viralPotential: number;
-          suggestedTitle: string;
-          suggestedHashtags: string[];
-        }
+          const timeRange = this.formatTimeRange(
+            moment.frameNumber - 1,
+            frames.length,
+            videoDuration,
+          );
+          return {
+            timestamp: timeRange.startTime,
+            startTime: timeRange.startTime,
+            endTime: timeRange.endTime,
+            duration: timeRange.duration,
+            description: moment.description,
+            viralPotential: moment.viralPotential,
+            suggestedTitle: moment.suggestedTitle,
+            suggestedHashtags: moment.suggestedHashtags,
+          } satisfies ViralMomentAnalysis;
+        })
+        .filter((moment): moment is ViralMomentAnalysis => moment !== null);
 
-        interface OpenAIResponse {
-          moments?: MomentData[];
-          frameNumber?: number;
-          description?: string;
-          viralPotential?: number;
-          suggestedTitle?: string;
-          suggestedHashtags?: string[];
-        }
-
-        const parsedContent = JSON.parse(content) as OpenAIResponse;
-        console.log('Parsed content:', parsedContent);
-
-        // Handle both array and single moment responses
-        const moments: MomentData[] = parsedContent.moments
-          ? parsedContent.moments
-          : parsedContent.frameNumber
-            ? [
-                {
-                  frameNumber: parsedContent.frameNumber,
-                  description: parsedContent.description || '',
-                  viralPotential: parsedContent.viralPotential || 0,
-                  suggestedTitle: parsedContent.suggestedTitle || '',
-                  suggestedHashtags: parsedContent.suggestedHashtags || [],
-                },
-              ]
-            : [];
-
-        if (!Array.isArray(moments)) {
-          console.error('Invalid response format from OpenAI:', parsedContent);
-          return [];
-        }
-
-        // Add time ranges to each moment
-        const momentsWithTimeRanges = moments
-          .map((moment: MomentData) => {
-            if (!moment.frameNumber) {
-              console.error('Invalid moment format:', moment);
-              return null;
-            }
-
-            const timeRange = this.formatTimeRange(
-              moment.frameNumber - 1,
-              frames.length,
-              videoDuration,
-            );
-            return {
-              timestamp: timeRange.startTime,
-              startTime: timeRange.startTime,
-              endTime: timeRange.endTime,
-              duration: timeRange.duration,
-              description: moment.description,
-              viralPotential: moment.viralPotential,
-              suggestedTitle: moment.suggestedTitle,
-              suggestedHashtags: moment.suggestedHashtags,
-            } satisfies ViralMomentAnalysis;
-          })
-          .filter((moment): moment is ViralMomentAnalysis => moment !== null);
-
-        console.log(
-          'Analysis results with time ranges:',
-          momentsWithTimeRanges,
-        );
-        return momentsWithTimeRanges;
-      } catch (parseError) {
-        console.error('Error parsing OpenAI response:', parseError);
-        return [];
-      }
+      console.log('Analysis results with time ranges:', momentsWithTimeRanges);
+      return momentsWithTimeRanges;
     } catch (error) {
       console.error('Error analyzing video:', error);
       if (error instanceof BadRequestException) {
