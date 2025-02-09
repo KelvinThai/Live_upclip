@@ -48,7 +48,7 @@ export class YouTubeShortsService {
 
       // Store refresh_token securely - you should save this in your database
       if (tokens.refresh_token) {
-        console.log('Refresh Token:', tokens.refresh_token);
+        // redirect to the frontend
         return tokens.refresh_token;
       }
       throw new BadRequestException('No refresh token received');

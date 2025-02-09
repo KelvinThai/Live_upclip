@@ -29,7 +29,7 @@ export class YouTubeShortsController {
     description: 'Returns the refresh token',
     type: String,
   })
-  async handleCallback(@Query('code') code: string): Promise<string> {
+  async handleCallback(@Query('code') code: string) {
     return await this.youtubeShortsService.handleCallback(code);
   }
 
