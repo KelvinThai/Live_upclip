@@ -8,7 +8,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
-const BATCH_SIZE = 3; // Process 3 frames per request
+const BATCH_SIZE = 10; // Process 3 frames per request
 const DELAY_BETWEEN_BATCHES = 1000; // 1 second delay between batches
 
 @Injectable()
@@ -21,7 +21,7 @@ export class AnalyzerAgentService {
     this.openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
     });
-    this.ensureDirectoryExists();
+    this.ensureDirectoryExists().catch(console.error);
     console.log('AnalyzerAgentService initialized successfully');
   }
 
@@ -83,16 +83,23 @@ export class AnalyzerAgentService {
   }
 
   private async extractFrames(videoPath: string): Promise<string[]> {
-    console.log(`Starting frame extraction for video: ${videoPath}`);
+    console.log(
+      `Starting content-based frame extraction for video: ${videoPath}`,
+    );
     const framePrefix = path.join(
       this.framesDir,
       path.basename(videoPath, path.extname(videoPath)),
     );
 
     try {
-      // Extract 5 frames from the video
-      const command = `ffmpeg -i "${videoPath}" -vf "fps=1/5" -frame_pts 1 "${framePrefix}_%d.jpg"`;
-      console.log('Executing ffmpeg command:', command);
+      // First, detect scenes based on content changes
+      const sceneCommand = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),metadata=print:file=${framePrefix}_scenes.txt" -f null -`;
+      console.log('Detecting scene changes...');
+      await execAsync(sceneCommand);
+
+      // Extract keyframes from each significant scene
+      const command = `ffmpeg -i "${videoPath}" -vf "select='gt(scene,0.3)',setpts=N/FRAME_RATE/TB" -vsync vfr -frame_pts 1 "${framePrefix}_%d.jpg"`;
+      console.log('Executing frame extraction command:', command);
       await execAsync(command);
       console.log('Frame extraction completed successfully');
 
@@ -100,16 +107,49 @@ export class AnalyzerAgentService {
       const files = await fs.readdir(this.framesDir);
       console.log('Reading frames directory contents...');
       const frames = files
-        .filter((file) =>
-          file.startsWith(path.basename(videoPath, path.extname(videoPath))),
+        .filter(
+          (file) =>
+            file.startsWith(
+              path.basename(videoPath, path.extname(videoPath)),
+            ) && file.endsWith('.jpg'),
         )
         .map((file) => path.join(this.framesDir, file));
 
-      console.log(`Found ${frames.length} frames:`, frames);
+      console.log(`Found ${frames.length} significant scenes:`, frames);
       return frames;
     } catch (error) {
       console.error('Error extracting frames:', error);
       throw new BadRequestException('Failed to process video frames');
+    }
+  }
+
+  private async getSceneInfo(
+    videoPath: string,
+  ): Promise<Array<{ time: number; score: number }>> {
+    const sceneInfoPath = path.join(
+      this.framesDir,
+      `${path.basename(videoPath, path.extname(videoPath))}_scenes.txt`,
+    );
+
+    try {
+      const sceneData = await fs.readFile(sceneInfoPath, 'utf-8');
+      const scenes = sceneData
+        .split('\n')
+        .filter((line) => line.includes('pts_time'))
+        .map((line) => {
+          const timeMatch = line.match(/pts_time:([\d.]+)/);
+          const scoreMatch = line.match(/scene_score=([\d.]+)/);
+          return {
+            time: timeMatch ? parseFloat(timeMatch[1]) : 0,
+            score: scoreMatch ? parseFloat(scoreMatch[1]) : 0,
+          };
+        });
+
+      await fs.unlink(sceneInfoPath).catch(console.error);
+      return scenes;
+    } catch (error) {
+      console.error('Error reading scene information:', error);
+      return [];
     }
   }
 
@@ -140,6 +180,7 @@ export class AnalyzerAgentService {
   private async processBatch(
     base64Frames: string[],
     startIndex: number,
+    sceneInfo: Array<{ time: number; score: number }>,
   ): Promise<{
     moments: Array<{
       frameNumber: number;
@@ -150,6 +191,14 @@ export class AnalyzerAgentService {
     }>;
   }> {
     console.log(`Processing batch starting at frame ${startIndex + 1}`);
+
+    // Format scene timings for context
+    const sceneContexts = sceneInfo.map((scene, idx) => {
+      const nextScene = sceneInfo[idx + 1];
+      const duration = nextScene ? nextScene.time - scene.time : 'end';
+      return `Scene ${idx + 1}: starts at ${scene.time}s, duration: ${duration}s, change score: ${scene.score}`;
+    });
+
     const response = await this.openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
@@ -158,12 +207,17 @@ export class AnalyzerAgentService {
           content: [
             {
               type: 'text',
-              text: `Analyze these frames from a video and identify potential viral moments. For each moment:
+              text: `Analyze these key scenes from the video and identify potential viral moments. Each frame represents a significant scene change or important moment.
+              
+              Scene timing information:
+              ${sceneContexts.join('\n')}
+              
+              For each scene:
               1. Identify the frame number (use absolute frame numbers starting from ${startIndex + 1})
-              2. Describe what makes it engaging
-              3. Rate its viral potential (1-10)
-              4. Suggest a catchy title
-              5. Suggest relevant hashtags
+              2. Describe the scene content and what makes it engaging, considering its timing and transition score
+              3. Rate its viral potential (1-10) based on visual appeal and content
+              4. Suggest a catchy title that captures the scene's essence
+              5. Suggest relevant hashtags for social media
               Format the response as JSON with these fields in an array called 'moments': frameNumber, description, viralPotential, suggestedTitle, suggestedHashtags.`,
             } as const,
             ...base64Frames.map((frame) => ({
@@ -222,7 +276,8 @@ export class AnalyzerAgentService {
         console.log(
           `Processing batch ${i / BATCH_SIZE + 1} of ${Math.ceil(base64Frames.length / BATCH_SIZE)}`,
         );
-        const result = await this.processBatch(batch, i);
+        const sceneInfo = await this.getSceneInfo(batch[0]);
+        const result = await this.processBatch(batch, i, sceneInfo);
         if (result.moments) {
           allMoments.push(...result.moments);
         }
@@ -259,9 +314,11 @@ export class AnalyzerAgentService {
       // Get video duration
       const videoDuration = await this.getVideoDuration(videoPath);
 
-      // Extract frames from video
-      console.log('Starting frame extraction process...');
+      // Extract frames from video based on scene changes
+      console.log('Starting scene-based frame extraction...');
       const frames = await this.extractFrames(videoPath);
+      const sceneInfo = await this.getSceneInfo(videoPath);
+
       console.log('Converting frames to base64...');
       const base64Frames = await this.convertFramesToBase64(frames);
 
@@ -276,24 +333,34 @@ export class AnalyzerAgentService {
       );
       console.log('Frame cleanup completed');
 
-      // Add time ranges to moments
+      // Add time ranges to moments using scene information
       const momentsWithTimeRanges = moments
-        .map((moment) => {
-          if (!moment.frameNumber) {
-            console.error('Invalid moment format:', moment);
+        .map((moment, index) => {
+          if (!moment.frameNumber || !sceneInfo[index]) {
+            console.error(
+              'Invalid moment format or missing scene info:',
+              moment,
+            );
             return null;
           }
 
-          const timeRange = this.formatTimeRange(
-            moment.frameNumber - 1,
-            frames.length,
-            videoDuration,
-          );
+          const sceneTime = sceneInfo[index].time;
+          const nextSceneTime = sceneInfo[index + 1]?.time || videoDuration;
+          const duration = nextSceneTime - sceneTime;
+
+          const formatTime = (seconds: number): string => {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const remainingSeconds = Math.floor(seconds % 60);
+            const milliseconds = Math.floor((seconds % 1) * 1000);
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
+          };
+
           return {
-            timestamp: timeRange.startTime,
-            startTime: timeRange.startTime,
-            endTime: timeRange.endTime,
-            duration: timeRange.duration,
+            timestamp: formatTime(sceneTime),
+            startTime: formatTime(sceneTime),
+            endTime: formatTime(nextSceneTime),
+            duration: formatTime(duration),
             description: moment.description,
             viralPotential: moment.viralPotential,
             suggestedTitle: moment.suggestedTitle,

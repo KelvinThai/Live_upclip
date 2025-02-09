@@ -5,7 +5,7 @@ import { AppService } from './app.service';
 import { UpfileModule } from './upfile/upfile.module';
 import { AnalyzerAgentModule } from './analyzer-agent/analyzer-agent.module';
 import { VideoEditorModule } from './video-editor/video-editor.module';
-
+import { YouTubeShortsModule } from './youtube-shorts/youtube-shorts.module';
 @Module({
   imports: [
     ConfigModule.forRoot({
@@ -14,6 +14,7 @@ import { VideoEditorModule } from './video-editor/video-editor.module';
     UpfileModule,
     AnalyzerAgentModule,
     VideoEditorModule,
+    YouTubeShortsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

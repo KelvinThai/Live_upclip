@@ -15,7 +15,7 @@ export class VideoEditorService {
   private readonly outputDir = 'uploads/edited';
 
   constructor() {
-    this.ensureDirectoryExists();
+    this.ensureDirectoryExists().catch(console.error);
   }
 
   private async ensureDirectoryExists() {
@@ -39,12 +39,26 @@ export class VideoEditorService {
     }
   }
 
+  private escapeText(text: string): string {
+    // Escape special characters and quotes for ffmpeg
+    return text
+      .replace(/'/g, "'\\''") // Escape single quotes
+      .replace(/:/g, '\\:') // Escape colons
+      .replace(/\[/g, '\\[') // Escape square brackets
+      .replace(/\]/g, '\\]')
+      .replace(/\(/g, '\\(') // Escape parentheses
+      .replace(/\)/g, '\\)')
+      .replace(/,/g, '\\,'); // Escape commas
+  }
+
   private async addCaptionToVideo(
     inputPath: string,
     outputPath: string,
     caption: string,
   ): Promise<void> {
-    const command = `ffmpeg -i "${inputPath}" -vf "drawtext=text='${caption}':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.5:boxborderw=5:x=(w-text_w)/2:y=h-th-10" -c:v libx264 -c:a aac "${outputPath}"`;
+    const escapedCaption = this.escapeText(caption);
+    const command = `ffmpeg -i "${inputPath}" -vf "drawtext=text='${escapedCaption}':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.5:boxborderw=5:x=(w-text_w)/2:y=h-th-10" -c:v libx264 -c:a aac "${outputPath}"`;
+    console.log('Executing caption command:', command);
     await execAsync(command);
   }
 
@@ -53,8 +67,11 @@ export class VideoEditorService {
     outputPath: string,
     hashtags: string[],
   ): Promise<void> {
-    const hashtagText = hashtags.join(' ');
-    const command = `ffmpeg -i "${inputPath}" -vf "drawtext=text='${hashtagText}':fontcolor=white:fontsize=20:box=1:boxcolor=black@0.5:boxborderw=5:x=(w-text_w)/2:y=10" -c:v libx264 -c:a aac "${outputPath}"`;
+    const escapedHashtags = hashtags
+      .map((tag) => this.escapeText(tag))
+      .join(' ');
+    const command = `ffmpeg -i "${inputPath}" -vf "drawtext=text='${escapedHashtags}':fontcolor=white:fontsize=20:box=1:boxcolor=black@0.5:boxborderw=5:x=(w-text_w)/2:y=10" -c:v libx264 -c:a aac "${outputPath}"`;
+    console.log('Executing hashtags command:', command);
     await execAsync(command);
   }
 
@@ -147,7 +164,7 @@ export class VideoEditorService {
       const { stdout: finalDurationOutput } = await execAsync(
         `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPath}"`,
       );
-
+      console.log('finished editing video', finalDurationOutput);
       return {
         outputPath,
         duration: parseFloat(finalDurationOutput),
